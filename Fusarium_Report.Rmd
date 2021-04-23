@@ -1,0 +1,335 @@
+---
+title: "Fusarium DS 682 Fungal Isolate Proteomics"
+author: "Lisa Bramer, Kelly Stratton"
+date: "9/24/2020"
+output: html_document
+bibliography: analysis_ref.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, warning = F, message = F)
+library(tidyverse)
+library(dplyr)
+library(pmartR)
+library(plotly)
+library(ggplot2)
+library(patchwork)
+```
+
+
+```{r data ingest}
+pro_data = read.table("MaxQuant Export Files/proteinGroups.txt", sep = "\t", header = T)
+
+mydata = pro_data[,c(grep("Majority", names(pro_data)), grep("^Intensity", names(pro_data))[-1])]
+names(mydata)[-1] = unlist(lapply(strsplit(names(mydata)[-1],"_"), function(x) paste(x[5:length(x)], collapse = "_")))
+
+no_obs = which(apply(mydata[,-1]==0, 1, sum) == 6)
+
+mydata = mydata[-no_obs,]
+
+fdata = data.frame(SampleID = names(mydata)[-1], Group = rep(c("No Mineral", "Mineral"), each = 3))
+emeta = pro_data[c("Majority.protein.IDs","Protein.IDs","Peptide.counts..unique.")]
+
+proDat = as.proData(e_data = mydata, f_data = fdata, e_meta = emeta, edata_cname = "Majority.protein.IDs", fdata_cname = "SampleID", emeta_cname = "Majority.protein.IDs")
+```
+
+
+```{r preprocessing}
+## data transform ##
+# replace 0s with NAs #
+proDat = edata_replace(proDat, 0, NA)
+
+# log transform #
+proDat = edata_transform(proDat, "log2")
+
+## filtering ##
+# contaminants #
+num_contam = sum(grepl("CON", proDat$e_data$Majority.protein.IDs))
+contams = grep("CON", proDat$e_data$Majority.protein.IDs, value = T)
+
+# reverse hits #
+num_rev = sum(grepl("REV", proDat$e_data$Majority.protein.IDs))
+revs = grep("REV", proDat$e_data$Majority.protein.IDs, value = T)
+
+con_rev_filt = custom_filter(proDat, e_data_remove = c(contams, revs))
+proDat_filt = applyFilt(con_rev_filt, proDat)
+
+# ones that map to ortholog's only #
+# get counts of occurences
+tx_counts = unlist(lapply(strsplit(proDat_filt$e_data$Majority.protein.IDs, ";"), function(x) sum(grepl("_tx", x))))
+
+ortNdbl = proDat_filt$e_data$Majority.protein.IDs[which(tx_counts != 1)]
+
+ort_dbl_filt = custom_filter(proDat_filt, e_data_remove = ortNdbl)
+proDat_filt2 = applyFilt(ort_dbl_filt, proDat_filt)
+
+proDat_filt2 = group_designation(proDat_filt2, main_effects = "Group")
+
+imdFilt = imdanova_filter(proDat_filt2)
+proDat_filt3 = applyFilt(imdFilt, proDat_filt2, min_nonmiss_anova = 2, min_nonmiss_gtest = 3)
+```
+
+Data at the level of protein groups (from 'proteinGroups.txt' file). A total of `r formatC(nrow(proDat$e_data), big.mark = ",")` protein groups were observed in at least one of the six samples. Two treatments, no mineral and mineral, with three replicate samples per treatment.
+
+### Data Preprocessing
+
+Abundance values were log2 transformed and all non-observed values were assigned a value of NA.
+
+#### Data Filtering
+
+All potential contaminants and reverse hits were removed. Additionally, any protein groups where 1) the majority protein identifier was comprised of only orthologs or 2) the majority protein identifier has multiple protein groups associated to the organism listed were filtered from the data. Finally, any protein groups with too few observations to conduct a quantitative or qualitative statistical comparison were removed (i.e. at least two observed values per group or at least three observed values in one group). **Figure 1** shows the log2 transformed abundance profiles before (left) and after (right) filtering was performed. Filtering did not change the abundance profiles distributions. **Table 1** gives the number of protein groups removed at each stage of filtering. The final dataset consisted of `r formatC(nrow(proDat_filt3$e_data), big.mark = ",")` protein groups.
+
+**Table 1: Number of protein groups removed by each filter applied to the data **
+
+| Filter | Number Removed |
+|--------|----------------|
+| Contaminants | `r num_contam` |
+| Reverse Hits | `r num_rev` |
+| Orthologs/Double Hits | `r nrow(proDat_filt$e_data) - nrow(proDat_filt2$e_data)` |
+| Observation Filter | `r nrow(proDat_filt2$e_data) - nrow(proDat_filt3$e_data)` |
+
+
+```{r}
+p1 = plot(proDat_filt, bw_theme = T) +
+  labs(title ="Before Filtering")
+p2 = plot(proDat_filt2, bw_theme = T) +
+  labs(title = "After Filtering")
+
+p1 + p2
+```
+
+**Figure 1: Log2 abundance profiles for each sample before (left) and after (right) filtering**
+
+#### Normalization
+
+SPANS [@spans] was run on the data to evaluate potential normalization strategies. Based on these results, data was normalized via median centering. **Figure 2** shows the normalized log2 transformed abudance profiles for each sample.
+
+
+```{r}
+#opt_params = get_spans_params(spans_res, sort_by_nmols = T)[[1]]
+
+normData = normalize_global(proDat_filt3, subset_fn = "all", norm_fn = "median", apply = T, backtransform = T)
+
+write.csv(normData$e_data, file = "fusarium_normalized_data.csv", row.names = F)
+
+plot(normData, bw_theme = T)
+```
+
+**Figure 2: Normalized log2 abundance profiles for each samples**
+
+### Statistical Analysis
+
+
+```{r}
+statRes = imd_anova(normData, test_method = "combined")
+
+stat_results = data.frame(Majority.protein.IDs = statRes$Full_results$Majority.protein.IDs,
+                          NObs_NoMineral = statRes$Full_results$`Count_No Mineral`,
+                          NObs_Mineral = statRes$Full_results$Count_Mineral,
+                          Mean_NoMineral = statRes$Full_results$`Mean_No Mineral`,
+                          Mean_Mineral = statRes$Full_results$Mean_Mineral,
+                          pvalue_Gtest_MvsNoM = statRes$Full_results$`P_value_G_No Mineral_vs_Mineral`,
+                          pvalue_ANOVA_MvsNoM = statRes$Full_results$`P_value_T_No Mineral_vs_Mineral`,
+                          Log2FC_MvsNoM = (-1)*statRes$Full_results$`Fold_change_No Mineral_vs_Mineral`)
+
+stat_res = merge(emeta, stat_results, by = "Majority.protein.IDs", all.x = F, all.y = T)
+stat_res$Flag_0.05_ANOVA_MvsNoM = 0
+stat_res$Flag_0.05_ANOVA_MvsNoM[which(stat_res$pvalue_ANOVA_MvsNoM <= 0.05 & stat_res$Log2FC_MvsNoM > 0)] = 1
+stat_res$Flag_0.05_ANOVA_MvsNoM[which(stat_res$pvalue_ANOVA_MvsNoM <= 0.05 & stat_res$Log2FC_MvsNoM < 0)] = -1
+
+stat_res$Flag_0.05_Gtest_MvsNoM = 0
+stat_res$Flag_0.05_Gtest_MvsNoM[which(stat_res$pvalue_Gtest_MvsNoM <= 0.05 & stat_res$NObs_Mineral > stat_res$NObs_NoMineral)] = 1
+stat_res$Flag_0.05_Gtest_MvsNoM[which(stat_res$pvalue_Gtest_MvsNoM <= 0.05 & stat_res$NObs_Mineral < stat_res$NObs_NoMineral)] = -1
+
+write.csv(stat_res, file = "fusarium_stat_results.csv", row.names = F)
+
+summ_res = stat_res %>% select(Flag_0.05_ANOVA_MvsNoM, Flag_0.05_Gtest_MvsNoM) %>% pivot_longer(cols = starts_with("Flag"))
+
+summ_res$Test = unlist(lapply(strsplit(summ_res$name, "_"), function(x) x[3]))
+summ_res2 = subset(summ_res, value != 0)
+summ_res2$Direction = factor(summ_res2$value, levels = c("-1", "1"), labels = c("Up in Mineral", "Down in Mineral"))
+```
+
+
+#### Differential Analyses
+
+A one-way analysis of variance (ANOVA) was run for each protein group to compare mean abundances of samples from the two conditions. Additionally, a G-test [@webb2010combined] was run to test for differences in presence/absence patterns with a null hypothesis that presence/absence patterns are not related to biological group. **Figure 3** shows the number of significant protein groups by direction of expression change for both tests. **Figure 4** gives a volcano plot showing the results from the ANOVA analyses. 
+
+```{r}
+ggplot(data = summ_res2, aes(x = Test, fill = Direction)) +
+  geom_bar(position = "dodge") +
+  theme_bw() +
+  ylab("Number of Significant Proteins") +
+  xlab("")
+  
+```
+
+**Figure 3: Number of significant protein groups (p-value $\leq$ 0.05) by test and direction of change**
+
+```{r}
+stat_res$Neg_Log10_pvalue = (-1)*log10(stat_res$pvalue_ANOVA_MvsNoM)
+
+p3 = ggplot(data = stat_res, aes(x = Log2FC_MvsNoM, y = Neg_Log10_pvalue, text = Majority.protein.IDs)) +
+  geom_point() +
+  geom_point(data = subset(stat_res, pvalue_ANOVA_MvsNoM <= 0.05), color = 2) +
+  theme_bw() +
+  xlab("Log2 Fold-Change (M/NoM)") +
+  ylab("-Log10 p-value")
+  
+ggplotly(p3)
+```
+
+**Figure 4: Volcano plot of ANOVA results. Protein groups with a p-value $\leq$ 0.05 are colored red**
+
+Filtered and normalized data is in the file 'fusarium\_normalized\_data.csv'. Statistical results are in the file 'fusarium\_stat\_results.csv'. Table 2 gives the names of the columns in the file and a description of the values in each column.
+
+
+**Table 2: Description of columns in statistical results file**
+
+| Column | Description |
+|--------|-------------|
+| Majority.protein.IDs | from original data output |
+| Protein.IDs | from original data output |
+| Peptide.counts..unique | from original data output |
+| NObs_NoMineral | number of samples from No Mineral treatment with observed abundance |
+| NObs_Mineral | number of samples from Mineral treatment with observed abundance |
+| Mean_NoMineral | mean normalized log2 abundance for No Mineral samples |
+| Mean_Mineral | mean normalized log2 abundance for Mineral samples |
+| pvalue_Gtest_MvsNoM | g-test p-value |
+| pvalue_ANOVA_MvsNoM | ANOVA p-value comparing mean abundances |
+| Log2FC_MvsNoM | Log2 fold-change of group means (M/NoM) |
+| Flag_0.05_ANOVA_MvsNoM | Flag indicating direction of quantitative change (0: not sig. different, 1: sig. up expressed in Mineral, -1: sig. down expressed in Mineral) |
+| Flag_0.05_Gtest_MvsNoM | Flag indicating direction of qualitative change (0: not sig. different, 1: observed more in Mineral, -1: observed less in Mineral) |
+
+#### Trelliscope Plots
+Data are visualized in boxplots of log2 abundance against treatment. All plots are collected into a trelliscope display, which allows you to cycle through all protein groups and filter plots by values such as p-values, fold-changes, and protein names. Many values to filter/sort/show protein groups are available in these displays. These metrics are named similar to those in the flat file statistical results. 
+
+- The ‘Grid’ icon on the left will allow you to change how many plots (features) will be shown at once.
+- The ‘Labels’ button will let you see what metrics and statistics are available for each features and allow you to choose which to display below the figure.
+- The ‘Filter’ button will let you choose a metric/statistic and specify a range on which to filter down the features. For example, one could filter on the range 0 - 0.05 on pvalue\_ANOVA to show only protein groups for which the null hypothesis of no difference in mineral and no mineral mean abundances was rejected at a significance level of 0.05.
+- Finally, the ‘Sort’ button will let you sort the plots by a statistic/metric. By default, the plots are sorted by the protein name from the organism of interest. You will click on the ‘x’ inside the blue icon reading ‘Protein’ at the very bottom left in order to remove this default sorting and sort by something else.
+
+```{r, eval = F}
+library(trelliscopejs)
+
+data_long = pivot_longer(normData$e_data, cols = contains("mineral")) %>% rename(SampleID = name) %>% inner_join(normData$f_data, by = "SampleID")
+
+data_long2 = data_long %>% mutate(Protein = unlist(lapply(strsplit(Majority.protein.IDs, ";"), function(x) grep("_tx", x, value = T))))
+
+byProt_data = data_long2 %>% group_by(Protein) %>% nest()
+
+byProt_stat = stat_res %>% mutate(Protein = unlist(lapply(strsplit(Majority.protein.IDs, ";"), function(x) grep("_tx", x, value = T)))) %>% group_by(Protein) %>% nest()
+
+names(byProt_stat)[2] = "stat"
+
+plot_fn <- function(x){
+  ggplot(data = x, aes(x = Group, y = value, color = Group)) +
+    geom_boxplot() +
+    geom_point() +
+    xlab("") +
+    ylab("Normalized Log2 Abundance") +
+    guides(color = F) +
+    theme_bw()
+    
+}
+
+cog_fn <- function(x){
+ tibble(
+    Majority_Protein_IDs = cog(x$Majority.protein.IDs, desc = "Majority protein ids"),
+    Peptide_Counts = cog(x$Peptide.counts..unique., desc = "Peptide counts unique"),
+    N_NoMineral = cog(x$NObs_NoMineral, desc = "Number of observations in No Mineral group"),
+    N_Mineral = cog(x$NObs_Mineral, desc = "Number of observations in Mineral group"),
+    Mean_NoMineral = cog(x$Mean_NoMineral, desc = "Mean abundance of No Mineral samples"),
+    Mean_Mineral = cog(x$Mean_Mineral, desc = "Mean abundance of Mineral samples"),
+    pvalue_Gtest = cog(x$pvalue_Gtest_MvsNoM, desc = "p-value from G-test for qualitative differences"),
+    pvalue_ANOVA = cog(x$pvalue_ANOVA_MvsNoM, desc = "p-value from ANOVA for mean differences")
+  )
+}
+
+byProt = byProt_data %>% inner_join(byProt_stat) %>% mutate(panel = map_plot(data, plot_fn), cogs = map_cog(stat, cog_fn)) 
+
+byProt %>% select(-data, -stat) %>% ungroup() %>% trelliscope(name = "fusarium_boxplots", path = "/Users/bram489/Documents/Anderton_Chris/Proteomics/trelliscope_plots", auto_cog = F)
+```
+
+<iframe src="./trelliscope_plots/index.html" width=1000px height=600px> </iframe>>
+
+#### Exploratory Data Analysis
+
+Sequential projection pursuit principal component analysis (PCA) was run [@sppca]; this method provides the benefit that missing data does not need to be imputed for the algorithm to run. **Figure 5** shows the first two principal component scores for each sample with points colored by group.
+
+```{r}
+pca_res = dim_reduction(proDat_filt3)
+
+plot(pca_res, bw_theme = T)
+```
+
+**Figure 5: Scores for the first two principal components, based on normalized protein group abundance profiles, for each sample with points colored by group**
+
+**Figures 6 - 8** give a glimpse of the protein group from the organism of interest compared to properties of orthologs mapping to the same protein group. All plots are interactive and points can be toggled on and off in the figure by clicking on the legend markers. **Figure 6** shows the number of peptides mapping to the organism of interest for a protein group (x-axis) and the number of peptides from the ortholog with the maximum number of peptides mapping to the same protein group (y-axis); points are colored by direction of change based on ANOVA. **Figure 7** gives a similar plot but the total number of peptides mapping to ortholog(s) is given on the y-axis. Finally, **Figure 8** is also similar, but the total number of ortholog proteins is on the y-axis.  
+
+```{r}
+mpro_ids = lapply(strsplit(stat_res$Majority.protein.IDs, ";"), function(x) grep("_tx", x, value = T))
+
+pro_ids = strsplit(stat_res$Protein.IDs, ";")
+
+pmp_ids = mapply(function(mpro, pro){
+  id = which(pro == mpro)
+}, mpro = mpro_ids, pro = pro_ids)
+
+pep_cnts = strsplit(stat_res$Peptide.counts..unique., ";")
+
+pep_cnt_summ = mapply(function(cnts, ids){
+  mycnt = as.numeric(as.character(cnts[ids]))
+  if(length(cnts) > 1){
+  maxcnt = max(as.numeric(as.character(cnts[-ids])))
+  totcnt = sum(as.numeric(as.character(cnts[-ids])))
+  totmatch = length(cnts[-ids])
+  }else{
+    maxcnt = totcnt = totmatch = 0
+  }
+  data.frame(Org_Peps = mycnt, Other_Max = maxcnt, Other_Total = totcnt, Other_Prots = totmatch)
+}, cnts = pep_cnts, ids = as.list(pmp_ids), SIMPLIFY = F)
+
+pep_cnt_summ2 = do.call(rbind, pep_cnt_summ)
+pep_cnt_summ3 = data.frame(stat_res, pep_cnt_summ2)
+pep_cnt_summ3$ANOVA_Flag = as.factor(pep_cnt_summ3$Flag_0.05_ANOVA_MvsNoM)
+
+p5 = ggplot(data = subset(pep_cnt_summ3, !is.na(pvalue_ANOVA_MvsNoM)), aes(x = Org_Peps, y = Other_Max, color = ANOVA_Flag, text = Majority.protein.IDs)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 1, lty = 2) +
+  theme_bw() +
+  xlab("Number of Peptides") +
+  ylab("Max Ortholog Number of Peptides")
+
+ggplotly(p5)
+```
+
+**Figure 6: Number of peptides mapping to organism vs the number of peptides associated with the ortholog with the maximum number of peptides. All points are colored by direction of change based on ANOVA results**
+
+```{r}
+p6 = ggplot(data = subset(pep_cnt_summ3, !is.na(pvalue_ANOVA_MvsNoM)), aes(x = Org_Peps, y = Other_Total, color = ANOVA_Flag, text = Majority.protein.IDs)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 1, lty = 2) +
+  theme_bw() +
+  xlab("Number of Peptides") +
+  ylab("Total of All Ortholog Peptides")
+
+ggplotly(p6)
+```
+
+**Figure 7: Number of peptides mapping to organism vs the total number of peptides associated with all ortholog proteins. All points are colored by direction of change based on ANOVA results**
+
+```{r}
+p7 = ggplot(data = subset(pep_cnt_summ3, !is.na(pvalue_ANOVA_MvsNoM)), aes(x = Org_Peps, y = Other_Prots, color = ANOVA_Flag, text = Majority.protein.IDs)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 1, lty = 2) +
+  theme_bw() +
+  xlab("Number of Peptides") +
+  ylab("Total Number of Ortholog Proteins")
+
+ggplotly(p7)
+```
+
+**Figure 8: Number of peptides mapping to organism vs the total number of ortholog proteins. All points are colored by direction of change based on ANOVA results**
+
+### References
